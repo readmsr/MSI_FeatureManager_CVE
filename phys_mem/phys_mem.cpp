@@ -263,7 +263,7 @@ int main()
         DWORD64 verify = read_u64(current_proc.eprocess_va + EPROCESS_TOKEN_OFFSET);
         if (verify == system_proc.token)
         {
-            std::cout << "New process token: " << std::hex << current_proc.token << "\n\n";
+            std::cout << "New process token: " << std::hex << verify << "\n\n";
             std::cout << "System token is stolen.\n";
         }
         else
